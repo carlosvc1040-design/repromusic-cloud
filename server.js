@@ -95,13 +95,17 @@ app.get('/api/stream/:videoId', (req, res) => {
 
     // Proxy raw bytes from YouTube → phone (no ffmpeg, no conversion)
     const getter = audioUrl.startsWith('https') ? https : http;
+    const proxyHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Encoding': 'identity'
+    };
+    // Only forward Range header if client sent one
+    if (req.headers.range) {
+      proxyHeaders['Range'] = req.headers.range;
+    }
     const proxyReq = getter.get(audioUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Encoding': 'identity',
-        'Range': req.headers.range || ''
-      }
+      headers: proxyHeaders
     }, (proxyRes) => {
       console.log(`YouTube responded: ${proxyRes.statusCode}, content-type: ${proxyRes.headers['content-type']}`);
 
