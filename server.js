@@ -1,48 +1,36 @@
 const express = require('express');
 const cors = require('cors');
-const { execFile, spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs');
+const { execFile } = require('child_process');
+const https = require('https');
+const http = require('http');
 const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// Temporary downloads directory (cloud ephemeral storage)
-const DOWNLOADS_DIR = path.join(os.tmpdir(), 'repromusic-downloads');
-if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
 app.use(cors());
 app.use(express.json());
 
 // ── Health Check ────────────────────────────────────────────────
 app.get('/api/ping', (req, res) => {
-  res.json({ status: 'ok', name: 'ReproMusic Cloud', version: '2.0' });
+  res.json({ status: 'ok', name: 'ReproMusic Cloud', version: '2.1' });
 });
 
-// ── Get raw audio URL (for Android app ExoPlayer) ───────────────
+// ── Get raw audio URL ───────────────────────────────────────────
 app.get('/api/audio-url/:videoId', (req, res) => {
   const { videoId } = req.params;
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  const args = [
-    url,
-    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    '--get-url',
-    '--no-playlist',
-    '--quiet',
-    '--no-warnings'
-  ];
-
-  execFile('yt-dlp', args, { timeout: 25000 }, (err, stdout) => {
+  execFile('yt-dlp', [
+    url, '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+    '--get-url', '--no-playlist', '--quiet', '--no-warnings'
+  ], { timeout: 25000 }, (err, stdout) => {
     if (err) {
       console.error('Audio URL error:', err.message);
       return res.status(500).json({ error: 'Failed to get audio URL' });
     }
-
     const audioUrl = stdout.trim().split('\n')[0];
     if (!audioUrl) return res.status(500).json({ error: 'No audio URL found' });
-
     res.json({ url: audioUrl, videoId });
   });
 });
@@ -52,23 +40,14 @@ app.get('/api/search', (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Missing query parameter q' });
 
-  const args = [
-    `ytsearch10:${query}`,
-    '--dump-json',
-    '--default-search', 'ytsearch',
-    '--no-playlist',
-    '--flat-playlist',
-    '--skip-download',
-    '--quiet',
-    '--no-warnings'
-  ];
-
-  execFile('yt-dlp', args, { maxBuffer: 1024 * 1024 * 10, timeout: 30000 }, (err, stdout) => {
+  execFile('yt-dlp', [
+    `ytsearch10:${query}`, '--dump-json', '--default-search', 'ytsearch',
+    '--no-playlist', '--flat-playlist', '--skip-download', '--quiet', '--no-warnings'
+  ], { maxBuffer: 1024 * 1024 * 10, timeout: 30000 }, (err, stdout) => {
     if (err) {
       console.error('Search error:', err.message);
       return res.status(500).json({ error: 'Search failed' });
     }
-
     try {
       const results = stdout.trim().split('\n').filter(l => l.trim()).map(line => {
         const data = JSON.parse(line);
@@ -81,57 +60,70 @@ app.get('/api/search', (req, res) => {
         };
       });
       res.json(results);
-    } catch (parseErr) {
-      console.error('Parse error:', parseErr.message);
+    } catch (e) {
       res.status(500).json({ error: 'Failed to parse results' });
     }
   });
 });
 
-// ── Audio streaming (proxy) ─────────────────────────────────────
+// ── Audio streaming (raw proxy, NO ffmpeg) ──────────────────────
+// Pipes raw audio bytes from YouTube through the server.
+// ExoPlayer handles m4a/webm natively, no conversion needed.
 app.get('/api/stream/:videoId', (req, res) => {
   const { videoId } = req.params;
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  const args = [
-    url,
-    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    '--get-url',
-    '--no-playlist',
-    '--quiet',
-    '--no-warnings'
-  ];
+  console.log(`Stream request: ${videoId}`);
 
-  execFile('yt-dlp', args, { timeout: 20000 }, (err, stdout) => {
+  execFile('yt-dlp', [
+    url, '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+    '--get-url', '--no-playlist', '--quiet', '--no-warnings'
+  ], { timeout: 25000 }, (err, stdout) => {
     if (err) {
-      console.error('Stream URL error:', err.message);
-      return res.status(500).json({ error: 'Failed to get stream URL' });
+      console.error('Stream error:', err.message);
+      if (!res.headersSent) res.status(500).json({ error: 'Failed to get stream URL' });
+      return;
     }
 
     const audioUrl = stdout.trim().split('\n')[0];
-    if (!audioUrl) return res.status(500).json({ error: 'No audio URL found' });
+    if (!audioUrl) {
+      if (!res.headersSent) res.status(500).json({ error: 'No audio URL found' });
+      return;
+    }
 
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Transfer-Encoding', 'chunked');
+    console.log(`Proxying audio for ${videoId}...`);
 
-    const ffmpeg = spawn('ffmpeg', [
-      '-i', audioUrl,
-      '-vn',
-      '-acodec', 'libmp3lame',
-      '-ab', '192k',
-      '-f', 'mp3',
-      '-'
-    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Proxy raw bytes from YouTube → phone (no ffmpeg, no conversion)
+    const getter = audioUrl.startsWith('https') ? https : http;
+    const proxyReq = getter.get(audioUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Encoding': 'identity',
+        'Range': req.headers.range || ''
+      }
+    }, (proxyRes) => {
+      console.log(`YouTube responded: ${proxyRes.statusCode}, content-type: ${proxyRes.headers['content-type']}`);
 
-    ffmpeg.stdout.pipe(res);
-    ffmpeg.stderr.on('data', () => {});
+      // Forward relevant headers
+      const headers = {
+        'Content-Type': proxyRes.headers['content-type'] || 'audio/mp4',
+        'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*'
+      };
+      if (proxyRes.headers['content-length']) headers['Content-Length'] = proxyRes.headers['content-length'];
+      if (proxyRes.headers['content-range']) headers['Content-Range'] = proxyRes.headers['content-range'];
 
-    ffmpeg.on('error', (err) => {
-      console.error('FFmpeg error:', err.message);
-      if (!res.headersSent) res.status(500).json({ error: 'Stream failed' });
+      res.writeHead(proxyRes.statusCode, headers);
+      proxyRes.pipe(res);
     });
 
-    req.on('close', () => ffmpeg.kill('SIGTERM'));
+    proxyReq.on('error', (e) => {
+      console.error('Proxy error:', e.message);
+      if (!res.headersSent) res.status(500).json({ error: 'Proxy failed' });
+    });
+
+    req.on('close', () => proxyReq.destroy());
   });
 });
 
@@ -139,7 +131,7 @@ app.get('/api/stream/:videoId', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     name: 'ReproMusic Cloud Server',
-    version: '2.0',
+    version: '2.1',
     endpoints: ['/api/ping', '/api/search?q=', '/api/audio-url/:videoId', '/api/stream/:videoId']
   });
 });
