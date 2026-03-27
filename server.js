@@ -17,15 +17,41 @@ app.get('/api/ping', (req, res) => {
 // ── Get raw audio URL ───────────────────────────────────────────
 app.get('/api/audio-url/:videoId', (req, res) => {
   const { videoId } = req.params;
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+
+  // Use android player client to bypass YouTube bot detection on cloud IPs
+  const args = [
+    url,
+    '-f', 'bestaudio[ext=m4a]/bestaudio',
+    '--get-url',
+    '--no-playlist',
+    '--quiet',
+    '--no-warnings',
+    '--extractor-args', 'youtube:player_client=android',
+    '--user-agent', 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip'
+  ];
+
+  execFile('yt-dlp', args, { timeout: 30000 }, (err, stdout, stderr) => {
+    if (err) {
+      console.error('Audio URL error:', err.message, stderr);
+      return res.status(500).json({ error: 'Failed', detail: stderr?.substring(0, 200) });
+    }
+    const audioUrl = stdout.trim().split('\n')[0];
+    if (!audioUrl) return res.status(500).json({ error: 'No URL found' });
+    console.log(`Got audio URL for ${videoId}: ${audioUrl.substring(0, 60)}...`);
+    res.json({ url: audioUrl, videoId });
+  });
+});
+
+// ── Debug endpoint ──────────────────────────────────────────────
+app.get('/api/debug/:videoId', (req, res) => {
+  const { videoId } = req.params;
   execFile('yt-dlp', [
     `https://www.youtube.com/watch?v=${videoId}`,
-    '-f', 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
-    '--get-url', '--no-playlist', '--quiet', '--no-warnings'
-  ], { timeout: 25000 }, (err, stdout) => {
-    if (err) return res.status(500).json({ error: 'Failed' });
-    const audioUrl = stdout.trim().split('\n')[0];
-    if (!audioUrl) return res.status(500).json({ error: 'No URL' });
-    res.json({ url: audioUrl, videoId });
+    '--get-title', '--quiet',
+    '--extractor-args', 'youtube:player_client=android'
+  ], { timeout: 30000 }, (err, stdout, stderr) => {
+    res.json({ success: !err, stdout: stdout?.trim(), stderr: stderr?.substring(0,500), code: err?.code });
   });
 });
 
