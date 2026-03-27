@@ -86,61 +86,76 @@ app.get('/api/search', (req, res) => {
   });
 });
 
-// ── Audio streaming (yt-dlp pipe, no ffmpeg needed) ─────────────
-// yt-dlp downloads and pipes audio bytes directly to the response.
-// ExoPlayer can handle m4a/webm natively.
+// ── Audio proxy (Native Node stream, fixes 416 & 403 errors) ───
+const https = require('https');
+
 app.get('/api/stream/:videoId', (req, res) => {
   const { videoId } = req.params;
   const url = `https://www.youtube.com/watch?v=${videoId}`;
+  console.log(`\n▶️ Proxy stream requested for: ${videoId}`);
 
-  console.log(`Stream: ${videoId}`);
-
-  // Use yt-dlp to pipe audio directly to stdout (no ffmpeg!)
-  const ytdlp = spawn('yt-dlp', [
+  // 1. Get raw URL via yt-dlp (fast) with robust iOS client bypass
+  // iOS client bypasses the HTTP 429 Too Many Requests bot block
+  const args = [
     url,
     '-f', 'bestaudio[ext=m4a]/bestaudio',
-    '-o', '-',
+    '--get-url',
     '--no-playlist',
     '--quiet',
     '--no-warnings',
-    '--no-part'
-  ], { stdio: ['pipe', 'pipe', 'pipe'] });
+    '--extractor-args', 'youtube:player_client=ios'
+  ];
 
-  let headersSent = false;
-  let stderrData = '';
-
-  ytdlp.stderr.on('data', (chunk) => {
-    stderrData += chunk.toString();
-  });
-
-  ytdlp.stdout.on('data', (chunk) => {
-    if (!headersSent) {
-      headersSent = true;
-      res.setHeader('Content-Type', 'audio/mp4');
-      res.setHeader('Transfer-Encoding', 'chunked');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      console.log(`Streaming ${videoId}...`);
+  execFile('yt-dlp', args, { timeout: 25000 }, (err, stdout, stderr) => {
+    if (err || !stdout.trim()) {
+      console.error('yt-dlp proxy error:', stderr?.substring(0, 150));
+      return res.status(500).send('Extractor failed');
     }
-    res.write(chunk);
-  });
 
-  ytdlp.on('close', (code) => {
-    if (!headersSent) {
-      console.error(`yt-dlp failed (${code}): ${stderrData}`);
-      res.status(500).json({ error: 'Stream failed', details: stderrData.substring(0, 200) });
-    } else {
-      res.end();
-      console.log(`Done streaming ${videoId}`);
+    const audioUrl = stdout.trim().split('\n')[0];
+    if (!audioUrl.startsWith('http')) return res.status(500).send('Invalid URL');
+    
+    console.log(`✅ Got audio URL for ${videoId}, initiating native pipe...`);
+
+    // 2. Set up headers for ExoPlayer
+    const options = {
+      headers: {}
+    };
+    
+    // Pass the Range header perfectly to support seek/partial load in ExoPlayer
+    if (req.headers.range) {
+      options.headers['Range'] = req.headers.range;
     }
-  });
 
-  ytdlp.on('error', (err) => {
-    console.error('yt-dlp spawn error:', err.message);
-    if (!headersSent) res.status(500).json({ error: 'Spawn failed' });
-  });
+    // 3. Pipe the audio natively via HTTP GET
+    const proxyReq = https.get(audioUrl, options, (proxyRes) => {
+      // Pass crucial ExoPlayer HTTP headers back
+      const headersToForward = [
+        'content-type', 'content-length', 'content-range', 
+        'accept-ranges', 'transfer-encoding'
+      ];
+      
+      headersToForward.forEach(h => {
+        if (proxyRes.headers[h]) res.setHeader(h, proxyRes.headers[h]);
+      });
 
-  req.on('close', () => {
-    ytdlp.kill('SIGTERM');
+      res.status(proxyRes.statusCode);
+
+      // Pipe data natively
+      proxyRes.pipe(res);
+      
+      proxyRes.on('end', () => console.log(`⏩ Finished streaming ${videoId}`));
+    });
+
+    proxyReq.on('error', (e) => {
+      console.error(`Proxy Request Error for ${videoId}:`, e.message);
+      if (!res.headersSent) res.status(500).send('Proxy failed');
+    });
+
+    // Handle client disconnects to kill the proxy upstream
+    req.on('close', () => {
+      proxyReq.destroy();
+    });
   });
 });
 
