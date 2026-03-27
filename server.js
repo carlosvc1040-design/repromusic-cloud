@@ -98,18 +98,17 @@ app.get('/api/stream/:videoId', (req, res) => {
   // iOS client bypasses the HTTP 429 Too Many Requests bot block
   const args = [
     url,
-    '-f', 'bestaudio[ext=m4a]/bestaudio',
+    '-f', 'bestaudio',
     '--get-url',
     '--no-playlist',
     '--quiet',
-    '--no-warnings',
-    '--extractor-args', 'youtube:player_client=ios'
+    '--no-warnings'
   ];
 
   execFile('yt-dlp', args, { timeout: 25000 }, (err, stdout, stderr) => {
     if (err || !stdout.trim()) {
       console.error('yt-dlp proxy error:', stderr?.substring(0, 150));
-      return res.status(500).send('Extractor failed');
+      return res.status(500).send(`Extractor failed: ${err?.message} | ${stderr}`);
     }
 
     const audioUrl = stdout.trim().split('\n')[0];
