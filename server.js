@@ -19,29 +19,35 @@ app.get('/api/audio-url/:videoId', (req, res) => {
   const { videoId } = req.params;
   const url = `https://www.youtube.com/watch?v=${videoId}`;
 
-  // Use android player client to bypass YouTube bot detection on cloud IPs
-  const args = [
-    url,
-    '-f', 'bestaudio[ext=m4a]/bestaudio',
-    '--get-url',
-    '--no-playlist',
-    '--quiet',
-    '--no-warnings',
-    '--extractor-args', 'youtube:player_client=android',
-    '--user-agent', 'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip'
-  ];
-
-  execFile('yt-dlp', args, { timeout: 30000 }, (err, stdout, stderr) => {
-    if (err) {
-      console.error('Audio URL error:', err.message, stderr);
-      return res.status(500).json({ error: 'Failed', detail: stderr?.substring(0, 200) });
+  // Try multiple clients - some bypass YouTube bot detection better than others
+  const tryClient = (clients, idx) => {
+    if (idx >= clients.length) {
+      return res.status(500).json({ error: 'All clients failed' });
     }
-    const audioUrl = stdout.trim().split('\n')[0];
-    if (!audioUrl) return res.status(500).json({ error: 'No URL found' });
-    console.log(`Got audio URL for ${videoId}: ${audioUrl.substring(0, 60)}...`);
-    res.json({ url: audioUrl, videoId });
-  });
+    const client = clients[idx];
+    const args = [
+      url,
+      '-f', 'bestaudio[ext=m4a]/bestaudio',
+      '--get-url',
+      '--no-playlist',
+      '--quiet',
+      '--no-warnings',
+      '--extractor-args', `youtube:player_client=${client}`
+    ];
+    execFile('yt-dlp', args, { timeout: 30000 }, (err, stdout, stderr) => {
+      if (err || !stdout.trim()) {
+        console.warn(`Client '${client}' failed: ${stderr?.substring(0,100)}, trying next...`);
+        return tryClient(clients, idx + 1);
+      }
+      const audioUrl = stdout.trim().split('\n')[0];
+      console.log(`Got URL via '${client}' for ${videoId}`);
+      res.json({ url: audioUrl, videoId });
+    });
+  };
+
+  tryClient(['ios', 'android', 'android_embedded', 'web_creator'], 0);
 });
+
 
 // ── Debug endpoint ──────────────────────────────────────────────
 app.get('/api/debug/:videoId', (req, res) => {
